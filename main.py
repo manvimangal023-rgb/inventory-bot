@@ -316,12 +316,49 @@ def run_chat(messages: list) -> str:
             )
         except Exception as e:
             if "tool_use_failed" in str(e):
+                # First, give it one more real attempt WITH tools (the failure may be transient)
+                try:
+                    retry_response = groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=messages,
+                        tools=TOOLS,
+                        tool_choice="required",
+                        temperature=0,
+                    )
+                    retry_message = retry_response.choices[0].message
+                    if retry_message.tool_calls:
+                        # succeeded this time -- process it as a normal tool-calling round
+                        response_message = retry_message
+                        tool_calls = retry_message.tool_calls
+                        messages.append(response_message)
+                        for tool_call in tool_calls:
+                            fn_name = tool_call.function.name
+                            fn_args = json.loads(tool_call.function.arguments)
+                            fn = AVAILABLE_FUNCTIONS.get(fn_name)
+                            try:
+                                result = fn(**fn_args) if fn else "Unknown tool requested."
+                            except TypeError as te:
+                                result = f"Tool call had invalid arguments ({te}). Please try again."
+                            messages.append({
+                                "role": "tool", "tool_call_id": tool_call.id,
+                                "name": fn_name, "content": result,
+                            })
+                        continue  # go round the main loop again to get the final answer
+                except Exception:
+                    pass  # fall through to the no-tools fallback below
+
                 fallback = groq_client.chat.completions.create(
                     model="llama-3.3-70b-versatile",
                     messages=messages,
                     temperature=0,
                 )
-                return fallback.choices[0].message.content
+                fallback_text = fallback.choices[0].message.content
+                if _looks_like_filler(fallback_text):
+                    return (
+                        "Sorry, I had trouble processing that request. Could you try rephrasing it "
+                        "(e.g. using the exact plant name) or asking again?"
+                    )
+                return fallback_text
             raise HTTPException(status_code=500, detail=f"Groq API error: {e}")
 
         response_message = response.choices[0].message
