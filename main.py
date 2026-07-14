@@ -308,7 +308,7 @@ def run_chat(messages: list) -> str:
         force_next_round = False
         try:
             response = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
                 messages=messages,
                 tools=TOOLS,
                 tool_choice="required" if force_tool else "auto",
@@ -319,7 +319,7 @@ def run_chat(messages: list) -> str:
                 # First, give it one more real attempt WITH tools (the failure may be transient)
                 try:
                     retry_response = groq_client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
+                        model="llama-3.1-8b-instant",
                         messages=messages,
                         tools=TOOLS,
                         tool_choice="required",
@@ -348,7 +348,7 @@ def run_chat(messages: list) -> str:
                     pass  # fall through to the no-tools fallback below
 
                 fallback = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                    model="llama-3.1-8b-instant",
                     messages=messages,
                     temperature=0,
                 )
@@ -400,7 +400,7 @@ def run_chat(messages: list) -> str:
                 "content": result,
             })
 
-    final = groq_client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages)
+    final = groq_client.chat.completions.create(model="llama-3.1-8b-instant", messages=messages)
     final_text = final.choices[0].message.content
     if _looks_like_filler(final_text):
         return (
