@@ -1,6 +1,13 @@
 """
 FastAPI backend for the inventory bot.
 Wraps inventory.db (SQLite) with simple HTTP endpoints.
+
+Run locally with:
+    uvicorn main:app --reload
+
+Then visit http://127.0.0.1:8000/docs for interactive API documentation
+(FastAPI auto-generates this -- try it, it's the easiest way to test endpoints
+by hand before wiring up a frontend).
 """
 import os
 import sqlite3
@@ -13,7 +20,7 @@ from tavily import TavilyClient
 from groq import Groq
 import json
 
-load_dotenv()
+load_dotenv()  # reads the .env file and loads API keys into the environment
 
 app = FastAPI(title="Inventory Bot API", version="1.0")
 
@@ -23,9 +30,10 @@ tavily_client = TavilyClient(api_key=tavily_key) if tavily_key else None
 groq_key = os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=groq_key) if groq_key else None
 
+# Allow the React frontend (running on a different port) to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # for local dev; tighten this before deploying publicly
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -35,7 +43,7 @@ DB_PATH = "inventory.db"
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = sqlite3.Row  # lets us return rows as dicts, not raw tuples
     return conn
 
 
@@ -46,6 +54,7 @@ def root():
 
 @app.get("/plants")
 def list_plants():
+    """Returns every distinct plant name in the database."""
     conn = get_connection()
     rows = conn.execute("SELECT DISTINCT plant FROM inventory ORDER BY plant").fetchall()
     conn.close()
@@ -54,6 +63,13 @@ def list_plants():
 
 @app.get("/inventory")
 def get_inventory(plant: Optional[str] = None, material: Optional[str] = None):
+    """
+    Returns inventory rows, optionally filtered by plant and/or material.
+    Examples:
+      /inventory                          -> everything (106 rows)
+      /inventory?plant=Ron Wind Farm      -> just that plant
+      /inventory?material=Generator       -> that material across all plants
+    """
     conn = get_connection()
     query = "SELECT plant, material, quantity, basis FROM inventory WHERE 1=1"
     params = []
@@ -75,14 +91,22 @@ def get_inventory(plant: Optional[str] = None, material: Optional[str] = None):
 
 @app.get("/websearch")
 def web_search(query: str):
+    """
+    Answers a general question by searching the live web via Tavily.
+    Use this for anything NOT in the plant inventory database --
+    e.g. "what does SCADA stand for", "current price of steel".
+    """
     if tavily_client is None:
-        raise HTTPException(status_code=500, detail="Tavily API key not configured. Check your .env file.")
+        raise HTTPException(
+            status_code=500,
+            detail="Tavily API key not configured. Check your .env file."
+        )
 
     result = tavily_client.search(query=query, max_results=3, include_answer=True)
 
     return {
         "query": query,
-        "answer": result.get("answer"),
+        "answer": result.get("answer"),          # Tavily's direct AI-generated answer
         "sources": [
             {"title": r["title"], "url": r["url"], "snippet": r["content"][:200]}
             for r in result.get("results", [])
@@ -91,6 +115,7 @@ def web_search(query: str):
 
 
 def _normalize(word: str) -> str:
+    """Strip common plural endings so 'gearboxes' matches 'Gearbox', 'bearings' matches 'Bearing', etc."""
     w = word.lower().strip()
     if w.endswith("es") and len(w) > 3:
         return w[:-2]
@@ -100,6 +125,7 @@ def _normalize(word: str) -> str:
 
 
 def query_inventory(plant: str = "", material: str = "") -> str:
+    """Query the real plant inventory database."""
     conn = get_connection()
     query = "SELECT plant, material, quantity FROM inventory WHERE 1=1"
     params = []
@@ -117,6 +143,7 @@ def query_inventory(plant: str = "", material: str = "") -> str:
 
 
 def web_search(query: str) -> str:
+    """Search the live internet for general questions."""
     if tavily_client is None:
         return "Web search is not configured."
     result = tavily_client.search(query=query, max_results=3, include_answer=True)
@@ -124,7 +151,9 @@ def web_search(query: str) -> str:
 
 
 def update_inventory(plant: str, material: str, new_quantity: int) -> str:
+    """Update the quantity of a specific material at a specific plant. Requires an exact plant+material match."""
     conn = get_connection()
+    # find the matching row first, so we can confirm exactly what's being changed
     rows = conn.execute(
         "SELECT id, plant, material, quantity FROM inventory WHERE plant LIKE ? AND material LIKE ?",
         (f"%{plant}%", f"%{_normalize(material)}%"),
@@ -146,6 +175,7 @@ def update_inventory(plant: str, material: str, new_quantity: int) -> str:
     return f"Updated: {row['plant']} - {row['material']} changed from {old_quantity} to {new_quantity}."
 
 
+# Groq (OpenAI-compatible) tool schema -- describes each function so the model can pick one
 TOOLS = [
     {
         "type": "function",
@@ -241,28 +271,38 @@ SYSTEM_PROMPT = (
 )
 
 
-FILLER_PHRASES = [
-    "let me check", "let me look", "let me search", "let me find",
-    "checking now", "i'll check", "i will check", "let me see",
-]
-
+# Signs the model leaked its internal tool-call syntax as plain text instead of
+# using the actual tool-calling mechanism (a known quirk of some Llama models on Groq)
 LEAKED_TOOLCALL_MARKERS = [
     "<|python_tag|>", "python_tag", "query_inventory(", "web_search(", "update_inventory(",
 ]
 
+# Broader filler detection: catches "I will/I'll/let me/going to" + an action verb
+# (check/query/search/look/find), regardless of the exact phrasing used -- this covers
+# variants like "I will check", "let me query", "I'll search", "going to look up", etc.
+INTENT_WORDS = ["i will", "i'll", "let me", "i am going to", "i'm going to", "going to"]
+ACTION_WORDS = ["check", "query", "search", "look", "find", "verify", "confirm", "get the", "pull the", "fetch"]
+
 
 def _looks_like_filler(text: str) -> bool:
+    """Detect an unfinished 'I'll go look this up' reply, OR a leaked raw tool-call, instead of a real answer."""
     if not text:
         return True
     lowered = text.lower()
     if any(marker.lower() in lowered for marker in LEAKED_TOOLCALL_MARKERS):
         return True
-    return any(phrase in lowered for phrase in FILLER_PHRASES) and len(text) < 150
+    if len(text) < 200:
+        has_intent = any(word in lowered for word in INTENT_WORDS)
+        has_action = any(word in lowered for word in ACTION_WORDS)
+        if has_intent and has_action:
+            return True
+    return False
 
 
 def run_chat(messages: list) -> str:
-    max_rounds = 4
-    force_next_round = True
+    """Core logic: runs the tool-calling loop given a full message list (with history), returns final answer text."""
+    max_rounds = 4  # one extra round of headroom for the filler-retry below
+    force_next_round = True  # always force a tool on round 0
     for round_num in range(max_rounds):
         force_tool = force_next_round
         force_next_round = False
@@ -288,6 +328,8 @@ def run_chat(messages: list) -> str:
         tool_calls = response_message.tool_calls
 
         if not tool_calls:
+            # Caught an unfinished "let me check" reply, or a leaked raw tool-call syntax,
+            # with rounds left -- force it to actually call a tool and finish the job.
             if _looks_like_filler(response_message.content) and round_num < max_rounds - 1:
                 messages.append({"role": "user", "content": (
                     "You did not actually provide an answer -- either you only said you would "
@@ -295,8 +337,14 @@ def run_chat(messages: list) -> str:
                     "real tool-calling mechanism. Call the appropriate tool now, properly, and "
                     "give the real answer."
                 )})
-                force_next_round = True
+                force_next_round = True  # make the retry round force a proper tool call too
                 continue
+            # Last chance and it's STILL broken -- never show raw/leaked syntax to the user.
+            if _looks_like_filler(response_message.content):
+                return (
+                    "Sorry, I had trouble processing that request. Could you try rephrasing it "
+                    "(e.g. using the exact plant name) or asking again?"
+                )
             return response_message.content
 
         messages.append(response_message)
@@ -304,7 +352,10 @@ def run_chat(messages: list) -> str:
             fn_name = tool_call.function.name
             fn_args = json.loads(tool_call.function.arguments)
             fn = AVAILABLE_FUNCTIONS.get(fn_name)
-            result = fn(**fn_args) if fn else "Unknown tool requested."
+            try:
+                result = fn(**fn_args) if fn else "Unknown tool requested."
+            except TypeError as e:
+                result = f"Tool call had invalid arguments ({e}). Please try again with correct parameters."
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
@@ -313,11 +364,18 @@ def run_chat(messages: list) -> str:
             })
 
     final = groq_client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages)
-    return final.choices[0].message.content
+    final_text = final.choices[0].message.content
+    if _looks_like_filler(final_text):
+        return (
+            "Sorry, I had trouble processing that request. Could you try rephrasing it "
+            "(e.g. using the exact plant name) or asking again?"
+        )
+    return final_text
 
 
 @app.get("/chat")
 def chat(message: str):
+    """Simple version, no memory -- kept for backward-compatible testing via /docs."""
     if not groq_client:
         raise HTTPException(status_code=500, detail="Groq API key not configured. Check your .env file.")
     messages = [
@@ -330,11 +388,15 @@ def chat(message: str):
 
 class ChatRequest(BaseModel):
     message: str
-    history: list[dict] = []
+    history: list[dict] = []  # e.g. [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
 
 
 @app.post("/chat")
 def chat_with_memory(req: ChatRequest):
+    """
+    Memory-aware version: pass prior conversation turns in `history` so the bot
+    can reference earlier questions (e.g. "what about bearings" after asking about a plant).
+    """
     if not groq_client:
         raise HTTPException(status_code=500, detail="Groq API key not configured. Check your .env file.")
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -346,6 +408,7 @@ def chat_with_memory(req: ChatRequest):
 
 @app.get("/inventory/summary")
 def inventory_summary():
+    """Returns total item-types and total units per plant -- a quick overview."""
     conn = get_connection()
     rows = conn.execute("""
         SELECT plant, COUNT(*) AS material_types, SUM(quantity) AS total_units
