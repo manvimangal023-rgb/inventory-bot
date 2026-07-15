@@ -307,11 +307,23 @@ def route_message(message: str, history: list) -> Optional[str]:
             return update_inventory(plant=prior_plant, material=prior_material, new_quantity=new_qty)
         return None
 
-    plant = find_plant(message)
+       plant = find_plant(message)
+    intent = detect_intent(message)
+
+    if not plant and intent == "location":
+        # Follow-up like "where is it located" / "what's its capacity" -- no
+        # plant name in THIS message, but one was clearly established earlier
+        # in the conversation. Resolve it from history instead of falling
+        # through to the LLM, which has no real knowledge of our plant names
+        # and will hallucinate a plausible-sounding location for them.
+        for turn in reversed(history):
+            prior_plant = find_plant(turn.get("content", "") or "")
+            if prior_plant:
+                plant = prior_plant
+                break
+
     if not plant:
         return None
-
-    intent = detect_intent(message)
 
     if intent == "location":
         return get_plant_info(plant=plant)
