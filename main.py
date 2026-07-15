@@ -2,27 +2,42 @@
 FastAPI backend for the inventory bot.
 Wraps inventory.db (SQLite) with simple HTTP endpoints.
 
+ARCHITECTURE (merged from two parallel fixes):
+1. DETERMINISTIC ROUTER (primary path): our domain is small and known (13 real
+   plants, 16 materials) -- we match plant/material names and detect intent with
+   plain Python BEFORE ever involving the LLM. This makes the "wrong tool /
+   malformed args / hallucinated answer" bug class structurally impossible for
+   anything in our own database, since the LLM never decides whether/how to
+   call anything for these questions.
+2. FIXED AGENTIC FALLBACK: for genuinely open-ended questions the router can't
+   match, we still fall back to LLM tool-calling (web_search) -- but with the
+   real root-cause bug fixed: the old code appended the raw SDK response object
+   back into the conversation, which carries invalid extra fields that made
+   Groq reject subsequent requests. That got misread as `tool_use_failed`,
+   triggering a no-tools fallback where the model would narrate fake tool
+   calls with invented data. Now we serialize only the valid fields, and every
+   tool-call failure mode is fed back to the model as a visible, recoverable
+   result instead of crashing or hallucinating.
+
 Run locally with:
     uvicorn main:app --reload
-
-Then visit http://127.0.0.1:8000/docs for interactive API documentation
-(FastAPI auto-generates this -- try it, it's the easiest way to test endpoints
-by hand before wiring up a frontend).
+Then visit http://127.0.0.1:8000/docs for interactive API documentation.
 """
 import os
+import re
+import json
 import sqlite3
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from tavily import TavilyClient
 from groq import Groq
-import json
 
-load_dotenv()  # reads the .env file and loads API keys into the environment
+load_dotenv()
 
-app = FastAPI(title="Inventory Bot API", version="1.0")
+app = FastAPI(title="Inventory Bot API", version="2.0")
 
 tavily_key = os.getenv("TAVILY_API_KEY")
 tavily_client = TavilyClient(api_key=tavily_key) if tavily_key else None
@@ -30,10 +45,9 @@ tavily_client = TavilyClient(api_key=tavily_key) if tavily_key else None
 groq_key = os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=groq_key) if groq_key else None
 
-# Allow the React frontend (running on a different port) to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # for local dev; tighten this before deploying publicly
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -43,7 +57,7 @@ DB_PATH = "inventory.db"
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row  # lets us return rows as dicts, not raw tuples
+    conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -54,7 +68,6 @@ def root():
 
 @app.get("/plants")
 def list_plants():
-    """Returns every distinct plant name in the database."""
     conn = get_connection()
     rows = conn.execute("SELECT DISTINCT plant FROM inventory ORDER BY plant").fetchall()
     conn.close()
@@ -63,13 +76,6 @@ def list_plants():
 
 @app.get("/inventory")
 def get_inventory(plant: Optional[str] = None, material: Optional[str] = None):
-    """
-    Returns inventory rows, optionally filtered by plant and/or material.
-    Examples:
-      /inventory                          -> everything (106 rows)
-      /inventory?plant=Ron Wind Farm      -> just that plant
-      /inventory?material=Generator       -> that material across all plants
-    """
     conn = get_connection()
     query = "SELECT plant, material, quantity, basis FROM inventory WHERE 1=1"
     params = []
@@ -79,34 +85,21 @@ def get_inventory(plant: Optional[str] = None, material: Optional[str] = None):
     if material:
         query += " AND material LIKE ?"
         params.append(f"%{material}%")
-
     rows = conn.execute(query, params).fetchall()
     conn.close()
-
     if not rows:
         raise HTTPException(status_code=404, detail="No matching inventory found.")
-
     return {"count": len(rows), "results": [dict(r) for r in rows]}
 
 
 @app.get("/websearch")
-def web_search(query: str):
-    """
-    Answers a general question by searching the live web via Tavily.
-    Use this for anything NOT in the plant inventory database --
-    e.g. "what does SCADA stand for", "current price of steel".
-    """
+def web_search_endpoint(query: str):
     if tavily_client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Tavily API key not configured. Check your .env file."
-        )
-
+        raise HTTPException(status_code=500, detail="Tavily API key not configured. Check your .env file.")
     result = tavily_client.search(query=query, max_results=3, include_answer=True)
-
     return {
         "query": query,
-        "answer": result.get("answer"),          # Tavily's direct AI-generated answer
+        "answer": result.get("answer"),
         "sources": [
             {"title": r["title"], "url": r["url"], "snippet": r["content"][:200]}
             for r in result.get("results", [])
@@ -114,8 +107,22 @@ def web_search(query: str):
     }
 
 
+@app.get("/inventory/summary")
+def inventory_summary():
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT plant, COUNT(*) AS material_types, SUM(quantity) AS total_units
+        FROM inventory GROUP BY plant ORDER BY plant
+    """).fetchall()
+    conn.close()
+    return {"summary": [dict(r) for r in rows]}
+
+
+# ============================================================================
+# CORE DATA FUNCTIONS -- used by both the deterministic router and the LLM tools
+# ============================================================================
+
 def _normalize(word: str) -> str:
-    """Strip common plural endings so 'gearboxes' matches 'Gearbox', 'bearings' matches 'Bearing', etc."""
     w = word.lower().strip()
     if w.endswith("es") and len(w) > 3:
         return w[:-2]
@@ -125,7 +132,6 @@ def _normalize(word: str) -> str:
 
 
 def query_inventory(plant: str = "", material: str = "") -> str:
-    """Query the real plant inventory database."""
     conn = get_connection()
     query = "SELECT plant, material, quantity FROM inventory WHERE 1=1"
     params = []
@@ -142,8 +148,30 @@ def query_inventory(plant: str = "", material: str = "") -> str:
     return "\n".join(f"{r['plant']}: {r['material']} = {r['quantity']}" for r in rows)
 
 
+def get_plant_info(plant: str = "") -> str:
+    """Real location, type, capacity, and commissioning year for a plant -- backed by the plant_info table."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT plant, state, plant_type, capacity_mw, approx_year FROM plant_info WHERE plant LIKE ?",
+        (f"%{plant}%",),
+    ).fetchall()
+    if not rows and plant:
+        first_word = plant.strip().split()[0]
+        rows = conn.execute(
+            "SELECT plant, state, plant_type, capacity_mw, approx_year FROM plant_info WHERE plant LIKE ?",
+            (f"%{first_word}%",),
+        ).fetchall()
+    conn.close()
+    if not rows:
+        return "No matching plant info found."
+    return "\n".join(
+        f"{r['plant']}: located in {r['state']}, India. Type: {r['plant_type']}. "
+        f"Capacity: {r['capacity_mw']}MW. Approx. commissioned: {r['approx_year']}."
+        for r in rows
+    )
+
+
 def web_search(query: str) -> str:
-    """Search the live internet for general questions."""
     if tavily_client is None:
         return "Web search is not configured."
     result = tavily_client.search(query=query, max_results=3, include_answer=True)
@@ -151,14 +179,11 @@ def web_search(query: str) -> str:
 
 
 def update_inventory(plant: str, material: str, new_quantity: int) -> str:
-    """Update the quantity of a specific material at a specific plant. Requires an exact plant+material match."""
     conn = get_connection()
-    # find the matching row first, so we can confirm exactly what's being changed
     rows = conn.execute(
         "SELECT id, plant, material, quantity FROM inventory WHERE plant LIKE ? AND material LIKE ?",
         (f"%{plant}%", f"%{_normalize(material)}%"),
     ).fetchall()
-
     if not rows:
         conn.close()
         return f"No matching row found for plant='{plant}', material='{material}'. Nothing was updated."
@@ -166,7 +191,6 @@ def update_inventory(plant: str, material: str, new_quantity: int) -> str:
         conn.close()
         matches = "; ".join(f"{r['plant']} - {r['material']}" for r in rows)
         return f"Multiple matches found, update aborted to avoid changing the wrong row: {matches}. Please be more specific."
-
     row = rows[0]
     old_quantity = row["quantity"]
     conn.execute("UPDATE inventory SET quantity = ? WHERE id = ?", (new_quantity, row["id"]))
@@ -175,117 +199,179 @@ def update_inventory(plant: str, material: str, new_quantity: int) -> str:
     return f"Updated: {row['plant']} - {row['material']} changed from {old_quantity} to {new_quantity}."
 
 
-# Groq (OpenAI-compatible) tool schema -- describes each function so the model can pick one
+# ============================================================================
+# DETERMINISTIC ROUTER -- primary path, no LLM involved at all
+# ============================================================================
+
+GENERIC_PLANT_WORDS = {"wind", "solar", "park", "project", "farm", "phase", "site", "the", "of", "in", "renew"}
+CONFIRMATION_PHRASES = {"yes", "yeah", "yep", "confirm", "do it", "go ahead", "yes please",
+                         "yes do it", "sure", "okay", "ok", "yes confirm", "confirmed"}
+
+
+def _get_known_plants() -> list:
+    conn = get_connection()
+    rows = conn.execute("SELECT DISTINCT plant FROM inventory").fetchall()
+    conn.close()
+    return [r["plant"] for r in rows]
+
+
+def find_plant(text: str) -> Optional[str]:
+    """Whole-word matching against distinctive plant-name tokens (ignoring generic
+    words like 'wind'/'solar' and single-letter tokens that could false-match)."""
+    text_words = set(re.findall(r"[A-Za-z]+", text.lower()))
+    best_plant, best_score = None, 0
+    for plant in _get_known_plants():
+        tokens = [t.lower() for t in re.findall(r"[A-Za-z]+", plant)
+                  if t.lower() not in GENERIC_PLANT_WORDS and len(t) > 1]
+        score = sum(1 for t in tokens if t in text_words)
+        if score > best_score:
+            best_score, best_plant = score, plant
+    return best_plant
+
+
+def find_material(text: str, plant: Optional[str] = None) -> Optional[str]:
+    conn = get_connection()
+    if plant:
+        rows = conn.execute("SELECT DISTINCT material FROM inventory WHERE plant LIKE ?", (f"%{plant}%",)).fetchall()
+    else:
+        rows = conn.execute("SELECT DISTINCT material FROM inventory").fetchall()
+    conn.close()
+    materials = [r["material"] for r in rows]
+
+    text_words = {_normalize(w) for w in re.findall(r"[A-Za-z]+", text)}
+    best_material, best_score = None, 0
+    for m in materials:
+        tokens = [_normalize(t) for t in re.findall(r"[A-Za-z]+", m)
+                  if len(t) > 3 and t.lower() not in GENERIC_PLANT_WORDS]
+        score = sum(1 for t in tokens if t in text_words)
+        if score > best_score:
+            best_score, best_material = score, m
+    return best_material
+
+
+def detect_intent(text: str) -> str:
+    t = text.lower()
+    if (re.search(r"\b(update|change|set)\b.*\d+", t) or re.search(r"\badd\b.*\d+", t)
+            or re.search(r"\b(remove|reduce|decrease|subtract)\b.*\d+", t)):
+        return "update"
+    if any(w in t for w in ["where", "location", "situated", "which state", "what state",
+                             "capacity of", "type of plant", "when was", "commissioned"]):
+        return "location"
+    return "inventory"
+
+
+def parse_new_quantity(text: str, current_qty: int) -> Optional[int]:
+    t = text.lower()
+    m = re.search(r"\bto\s+(\d+)\b", t)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"\b(add|increase)\b.*?(\d+)", t)
+    if m:
+        return current_qty + int(m.group(2))
+    m = re.search(r"\b(remove|reduce|decrease|subtract)\b.*?(\d+)", t)
+    if m:
+        return current_qty - int(m.group(2))
+    return None
+
+
+def is_confirmation(text: str) -> bool:
+    return text.strip().lower().rstrip(".! ") in CONFIRMATION_PHRASES
+
+
+def extract_current_quantity(query_result_text: str) -> Optional[int]:
+    m = re.search(r"=\s*(\d+)\s*$", query_result_text.strip())
+    return int(m.group(1)) if m else None
+
+
+def route_message(message: str, history: list) -> Optional[str]:
+    """Returns a final answer string, or None if nothing in our known domain matched
+    (caller should fall back to the agentic LLM path in that case)."""
+    if is_confirmation(message):
+        for turn in reversed(history):
+            if turn.get("role") != "user":
+                continue
+            prior_text = turn.get("content", "") or ""
+            prior_plant = find_plant(prior_text)
+            if not prior_plant:
+                continue
+            prior_material = find_material(prior_text, prior_plant)
+            if not prior_material or detect_intent(prior_text) != "update":
+                continue
+            current = query_inventory(plant=prior_plant, material=prior_material)
+            current_qty = extract_current_quantity(current)
+            if current_qty is None:
+                continue
+            new_qty = parse_new_quantity(prior_text, current_qty)
+            if new_qty is None:
+                continue
+            return update_inventory(plant=prior_plant, material=prior_material, new_quantity=new_qty)
+        return None
+
+    plant = find_plant(message)
+    if not plant:
+        return None
+
+    intent = detect_intent(message)
+
+    if intent == "location":
+        return get_plant_info(plant=plant)
+
+    if intent == "update":
+        material = find_material(message, plant)
+        if not material:
+            return f"Which material at {plant} would you like to update?"
+        current = query_inventory(plant=plant, material=material)
+        current_qty = extract_current_quantity(current)
+        if current_qty is None:
+            return f"Couldn't find a current quantity for {material} at {plant} to base the update on."
+        new_qty = parse_new_quantity(message, current_qty)
+        if new_qty is None:
+            return f"{plant} currently has {current_qty} {material}. What should the new quantity be?"
+        return f"{plant} currently has {current_qty} {material}. I'll update it to {new_qty} -- reply 'yes' to confirm."
+
+    material = find_material(message, plant)
+    return query_inventory(plant=plant, material=material or "")
+
+
+# ============================================================================
+# AGENTIC FALLBACK -- only reached when route_message() returns None, i.e. the
+# question isn't about anything in our known plant/material domain.
+# ============================================================================
+
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "query_inventory",
-            "description": (
-                "Query the real plant inventory database. Use this for ANY question about "
-                "specific wind/solar plants, their materials (turbines, panels, gearboxes, "
-                "inverters, etc.), or quantities held."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "plant": {"type": "string", "description": "Plant name to filter by, or empty for all plants"},
-                    "material": {"type": "string", "description": "Material name to filter by, or empty for all materials"},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "web_search",
-            "description": (
-                "Search the live internet for general questions NOT related to our specific "
-                "plant inventory database -- e.g. definitions, current events, prices, general facts."
-            ),
+            "description": "Search the live internet for general questions -- e.g. definitions, current events, prices, general facts.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query"},
-                },
+                "properties": {"query": {"type": "string", "description": "The search query"}},
                 "required": ["query"],
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_inventory",
-            "description": (
-                "Update (overwrite) the quantity of a specific material at a specific plant in the "
-                "real database. Only call this after the user has clearly confirmed they want the "
-                "change made -- e.g. they said 'yes, update it' or similar. You must pass the FINAL "
-                "absolute new_quantity (not a delta) -- if the user says 'add 5', first find the "
-                "current quantity via query_inventory, then compute and pass current+5 as new_quantity."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "plant": {"type": "string", "description": "Exact or partial plant name"},
-                    "material": {"type": "string", "description": "Exact or partial material name"},
-                    "new_quantity": {"type": "integer", "description": "The final absolute quantity to set"},
-                },
-                "required": ["plant", "material", "new_quantity"],
-            },
-        },
-    },
 ]
 
-AVAILABLE_FUNCTIONS = {
-    "query_inventory": query_inventory,
-    "web_search": web_search,
-    "update_inventory": update_inventory,
-}
-
+AVAILABLE_FUNCTIONS = {"web_search": web_search}
 
 SYSTEM_PROMPT = (
-    "You are an assistant for a renewable energy plant inventory system. "
-    "You have EXACTLY three tools, with these EXACT names: query_inventory (for reading "
-    "questions about specific plants, materials, or quantities), web_search (for general "
-    "questions), and update_inventory (for changing a quantity in the real database). No "
-    "other tools exist -- never reference, invent, or narrate a call to any tool by any "
-    "other name (e.g. there is no 'get_plant_info' or similar). "
-    "If query_inventory returns 'No matching inventory found', try web_search "
-    "before giving up. Never write a function call out as plain text -- always "
-    "use the proper tool-calling mechanism, never describe one in prose (e.g. never say "
-    "'Using X, I found...') -- either you actually invoked the tool via the real "
-    "function-calling mechanism and got a real result, or you say you don't know. "
-    "Any specific plant location, quantity, or fact you state MUST have come from an "
-    "actual tool result present earlier in this conversation -- never state such a fact "
-    "from memory or assumption. "
-    "CRITICAL: once a tool returns a result, your final answer MUST directly state "
-    "the actual information found (the number, the definition, the fact) -- never "
-    "reply with only a vague acknowledgment like 'let me know if you need anything else' "
-    "without first stating what was actually found. "
-    "You have access to the earlier messages in this conversation -- use them for context "
-    "(e.g. if the user says 'what about bearings', check what plant was discussed earlier). "
-    "IMPORTANT for updates: this is a real, permanent change to the database, so only call "
-    "update_inventory after the user has explicitly confirmed (e.g. they said 'yes', 'do it', "
-    "'confirm', or similar) in response to you asking them to confirm the exact change. If they "
-    "ask to add/remove/change a quantity for the first time without having already confirmed, "
-    "first look up the current value with query_inventory, state the exact change you're about "
-    "to make (old value -> new value) and ask them to confirm before calling update_inventory. "
-    "NEVER reply with a mid-process filler phrase like 'let me check', 'let me look into that', "
-    "'let me search', or 'checking now' as your FINAL answer -- these are only acceptable as "
-    "internal reasoning before you actually call a tool, never as the message shown to the user. "
-    "Every final answer must contain the actual requested information (a number, a name, a fact, "
-    "or an explicit question asking for confirmation/clarification) -- not a promise to look something up."
+    "You are a general-knowledge assistant. You have EXACTLY one tool, web_search, for "
+    "anything requiring current or factual information you're not certain of. No other "
+    "tools exist -- never reference, invent, or narrate a call to any other tool name. "
+    "Never write a function call out as plain text -- either you actually invoked "
+    "web_search via the real function-calling mechanism and got a real result, or you "
+    "say you don't know. Never describe having used a tool in prose (e.g. never say "
+    "'Using X, I found...') unless you actually made that exact tool call. "
+    "Your final answer must directly state the actual information found -- never a vague "
+    "'let me check' or 'I'll look into that' as a final answer."
 )
 
-
-FILLER_PHRASES = [
-    "let me check", "let me look", "let me search", "let me find",
-    "checking now", "i'll check", "i will check", "let me see",
-]
+FILLER_PHRASES = ["let me check", "let me look", "let me search", "let me find",
+                   "checking now", "i'll check", "i will check", "let me see"]
 
 
 def _looks_like_filler(text: str) -> bool:
-    """Detect an unfinished 'I'll go look this up' reply instead of an actual answer."""
     if not text:
         return True
     lowered = text.lower()
@@ -293,37 +379,20 @@ def _looks_like_filler(text: str) -> bool:
 
 
 def _serialize_assistant_message(response_message) -> dict:
-    """
-    Convert the Groq SDK's response message object into a plain dict containing
-    ONLY the fields that are valid in an outgoing request (role, content, tool_calls).
-
-    BUG THIS FIXES: the old code did `messages.append(response_message)`, appending the
-    raw pydantic object straight back into the message list. response_message.model_dump()
-    actually contains several response-only fields (`annotations`, `executed_tools`,
-    `function_call`, `reasoning`) that aren't part of a valid request message. When that
-    object got serialized into the *next* API call, Groq would sometimes reject it --
-    which the code misread as a `tool_use_failed` error and "fixed" by dropping tools
-    entirely and letting the model free-associate an answer. That's the root cause of the
-    hallucinated, fake tool-call narrations: the model was being asked to answer as if it
-    had tool access (because the system prompt still describes the tools) with no actual
-    tool attached, so it made something up that *looked* like a real tool result.
-    """
+    """Only the fields valid in an outgoing request -- NOT the raw SDK object,
+    which carries extra response-only fields that can make the next API call fail."""
     msg = {"role": "assistant", "content": response_message.content}
     if response_message.tool_calls:
         msg["tool_calls"] = [
-            {
-                "id": tc.id,
-                "type": tc.type,
-                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-            }
+            {"id": tc.id, "type": tc.type,
+             "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
             for tc in response_message.tool_calls
         ]
     return msg
 
 
-def run_chat(messages: list) -> str:
-    """Core logic: runs the tool-calling loop given a full message list (with history), returns final answer text."""
-    max_rounds = 5  # one extra round of headroom for the filler-retry / tool-failure-retry below
+def run_agentic_fallback(messages: list) -> str:
+    max_rounds = 4
     for round_num in range(max_rounds):
         force_tool = round_num == 0
         try:
@@ -335,21 +404,12 @@ def run_chat(messages: list) -> str:
                 temperature=0,
             )
         except Exception as e:
-            err = str(e)
-            if "tool_use_failed" in err and round_num < max_rounds - 1:
-                # The model emitted a malformed tool call. Do NOT drop the tools and let it
-                # free-associate an answer -- that's what produced hallucinated "fake tool
-                # narrations" before. Instead, tell it plainly what happened and make it
-                # retry the tool call for real, with tools still attached.
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "Your last tool call attempt was malformed and was not executed. "
-                        "No information was retrieved. Do not answer from memory and do not "
-                        "describe a tool call in plain text -- call the tool again using the "
-                        "correct function-calling format."
-                    ),
-                })
+            if "tool_use_failed" in str(e) and round_num < max_rounds - 1:
+                messages.append({"role": "user", "content": (
+                    "Your last tool call attempt was malformed and was not executed. "
+                    "Do not answer from memory -- call web_search again using the "
+                    "correct function-calling format."
+                )})
                 continue
             raise HTTPException(status_code=500, detail=f"Groq API error: {e}")
 
@@ -359,44 +419,37 @@ def run_chat(messages: list) -> str:
         if not tool_calls:
             retry_reason = None
             if force_tool:
-                # tool_choice was "required" this round, so a real tool call should have
-                # happened. Groq doesn't always enforce tool_choice="required" for this
-                # model -- the model can still just write plain text instead, sometimes
-                # narrating a completely invented tool name (e.g. "Using get_plant_info, I
-                # found...") with fabricated data. That text is NOT a real tool result and
-                # must never be trusted or returned as-is.
                 retry_reason = (
-                    "You did not actually call a tool, even though one was required for this "
-                    "turn, and no information was retrieved. Do not narrate a tool call in "
-                    "plain text and do not invent tool or function names -- the only tools "
-                    "that exist are query_inventory, web_search, and update_inventory. Call "
-                    "one of them for real now using the proper function-calling mechanism."
+                    "You did not actually call web_search, even though it was required. "
+                    "Do not narrate a tool call in plain text -- call it for real now."
                 )
             elif _looks_like_filler(response_message.content):
-                # Caught an unfinished "let me check" reply with rounds left -- force it to
-                # actually call a tool and finish the job instead of returning filler.
-                retry_reason = (
-                    "You did not actually provide an answer -- you only said you would check. "
-                    "Call the appropriate tool now and give the real answer."
-                )
-
+                retry_reason = "You only said you would check. Call web_search now and give the real answer."
             if retry_reason and round_num < max_rounds - 1:
                 messages.append({"role": "user", "content": retry_reason})
                 continue
-            return response_message.content
+            return response_message.content or "Sorry, I couldn't find an answer to that."
 
         messages.append(_serialize_assistant_message(response_message))
         for tool_call in tool_calls:
             fn_name = tool_call.function.name
-            fn_args = json.loads(tool_call.function.arguments)
-            fn = AVAILABLE_FUNCTIONS.get(fn_name)
-            result = fn(**fn_args) if fn else "Unknown tool requested."
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "name": fn_name,
-                "content": result,
-            })
+            try:
+                fn_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError as e:
+                fn_args = None
+                result = f"Tool call failed: arguments were not valid JSON ({e})."
+            if fn_args is not None:
+                fn = AVAILABLE_FUNCTIONS.get(fn_name)
+                if not fn:
+                    result = f"Unknown tool requested: '{fn_name}'."
+                else:
+                    try:
+                        result = fn(**fn_args)
+                    except TypeError as e:
+                        result = f"Tool call failed: invalid arguments {fn_args!r} ({e})."
+                    except Exception as e:
+                        result = f"Tool call failed: {e}."
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": fn_name, "content": result})
 
     try:
         final = groq_client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages)
@@ -405,48 +458,39 @@ def run_chat(messages: list) -> str:
         raise HTTPException(status_code=500, detail=f"Groq API error: {e}")
 
 
+def handle_chat(message: str, history: list) -> dict:
+    """Try the deterministic router first; only fall back to the LLM if nothing matched."""
+    routed = route_message(message, history)
+    if routed is not None:
+        return {"message": message, "answer": routed, "routed": "deterministic"}
+
+    if not groq_client:
+        return {"message": message, "answer": web_search(message), "routed": "web_search_direct"}
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": message})
+    try:
+        answer = run_agentic_fallback(messages)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected server error: {e}")
+    return {"message": message, "answer": answer, "routed": "agentic_llm"}
+
+
 @app.get("/chat")
 def chat(message: str):
     """Simple version, no memory -- kept for backward-compatible testing via /docs."""
-    if not groq_client:
-        raise HTTPException(status_code=500, detail="Groq API key not configured. Check your .env file.")
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": message},
-    ]
-    answer = run_chat(messages)
-    return {"message": message, "answer": answer}
+    return handle_chat(message, history=[])
 
 
 class ChatRequest(BaseModel):
     message: str
-    history: list[dict] = []  # e.g. [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+    history: list[dict] = []
 
 
 @app.post("/chat")
 def chat_with_memory(req: ChatRequest):
-    """
-    Memory-aware version: pass prior conversation turns in `history` so the bot
-    can reference earlier questions (e.g. "what about bearings" after asking about a plant).
-    """
-    if not groq_client:
-        raise HTTPException(status_code=500, detail="Groq API key not configured. Check your .env file.")
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(req.history)
-    messages.append({"role": "user", "content": req.message})
-    answer = run_chat(messages)
-    return {"message": req.message, "answer": answer}
-
-
-@app.get("/inventory/summary")
-def inventory_summary():
-    """Returns total item-types and total units per plant -- a quick overview."""
-    conn = get_connection()
-    rows = conn.execute("""
-        SELECT plant, COUNT(*) AS material_types, SUM(quantity) AS total_units
-        FROM inventory
-        GROUP BY plant
-        ORDER BY plant
-    """).fetchall()
-    conn.close()
-    return {"summary": [dict(r) for r in rows]}
+    """Memory-aware version: pass prior conversation turns in `history`."""
+    return handle_chat(req.message, history=req.history)
