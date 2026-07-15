@@ -136,45 +136,10 @@ def query_inventory(plant: str = "", material: str = "") -> str:
         query += " AND material LIKE ?"
         params.append(f"%{_normalize(material)}%")
     rows = conn.execute(query, params).fetchall()
-    # If the full plant phrase didn't match (e.g. "ron farm" vs "Ron Wind Farm"), retry on just the first word
-    if not rows and plant:
-        first_word = plant.strip().split()[0]
-        query2 = "SELECT plant, material, quantity FROM inventory WHERE plant LIKE ?"
-        params2 = [f"%{first_word}%"]
-        if material:
-            query2 += " AND material LIKE ?"
-            params2.append(f"%{_normalize(material)}%")
-        rows = conn.execute(query2, params2).fetchall()
     conn.close()
     if not rows:
         return "No matching inventory found."
     return "\n".join(f"{r['plant']}: {r['material']} = {r['quantity']}" for r in rows)
-
-
-def get_plant_info(plant: str = "") -> str:
-    """Get real location, type, and capacity info for a plant. Use this for 'where is X' / 'what state' / 'what type/capacity' questions."""
-    conn = get_connection()
-    query = "SELECT plant, state, plant_type, capacity_mw, approx_year FROM plant_info WHERE 1=1"
-    params = []
-    if plant:
-        query += " AND plant LIKE ?"
-        params.append(f"%{plant}%")
-    rows = conn.execute(query, params).fetchall()
-    # If the full phrase didn't match (e.g. "ron farm" vs "Ron Wind Farm"), retry on just the first word
-    if not rows and plant:
-        first_word = plant.strip().split()[0]
-        rows = conn.execute(
-            "SELECT plant, state, plant_type, capacity_mw, approx_year FROM plant_info WHERE plant LIKE ?",
-            (f"%{first_word}%",),
-        ).fetchall()
-    conn.close()
-    if not rows:
-        return "No matching plant info found."
-    return "\n".join(
-        f"{r['plant']}: located in {r['state']}, India. Type: {r['plant_type']}. "
-        f"Capacity: {r['capacity_mw']}MW. Approx. commissioned: {r['approx_year']}."
-        for r in rows
-    )
 
 
 def web_search(query: str) -> str:
@@ -269,93 +234,98 @@ TOOLS = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_plant_info",
-            "description": (
-                "Get REAL location (state), type (wind/solar), capacity, and commissioning year "
-                "for a plant. Use this for ANY question about where a plant is located, what "
-                "state it's in, its type, or its capacity. NEVER guess this from memory."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "plant": {"type": "string", "description": "Plant name to look up"},
-                },
-                "required": ["plant"],
-            },
-        },
-    },
 ]
 
 AVAILABLE_FUNCTIONS = {
     "query_inventory": query_inventory,
     "web_search": web_search,
     "update_inventory": update_inventory,
-    "get_plant_info": get_plant_info,
 }
 
 
 SYSTEM_PROMPT = (
-    "You are an inventory assistant for a renewable energy company. You have 4 tools: "
-    "query_inventory (plant/material quantities), get_plant_info (real location/state/type/capacity "
-    "of a plant), web_search (general questions), and update_inventory (change a quantity -- only "
-    "after the user has clearly said yes/confirm to a specific change you proposed). "
-    "TOOL PRIORITY -- this is critical: if the question mentions a specific plant name (even "
-    "informally, e.g. 'ron farm' meaning Ron Wind Farm) and asks about its location, capacity, "
-    "type, materials, or quantities, you MUST try query_inventory or get_plant_info FIRST. Only "
-    "use web_search if those return no matching data, OR the question is clearly about something "
-    "unrelated to our specific plants (e.g. general definitions, unrelated topics). Our plants are "
-    "obscure real-world entities that may share a name with unrelated things (fictional places, "
-    "other companies, etc.) -- web_search results about a similarly-named but different thing are "
-    "NOT a valid answer, so always check our own database tools first for anything plant-related. "
-    "Rules: always use a tool to answer, never guess from memory. This is CRITICAL: you must NEVER "
-    "invent facts about a specific named plant (location, capacity, history, etc.) from your own "
-    "knowledge -- these are real companies and real places, and a wrong guess is worse than saying "
-    "you don't know. If a tool returns no matching data, say so honestly instead of making something up. "
-    "Your final reply must state the actual answer (a number, name, or fact) -- never just say you'll "
-    "check or look something up. Use earlier messages in this conversation for context, e.g. "
-    "remembering which plant was just discussed."
+    "You are an assistant for a renewable energy plant inventory system. "
+    "You have EXACTLY three tools, with these EXACT names: query_inventory (for reading "
+    "questions about specific plants, materials, or quantities), web_search (for general "
+    "questions), and update_inventory (for changing a quantity in the real database). No "
+    "other tools exist -- never reference, invent, or narrate a call to any tool by any "
+    "other name (e.g. there is no 'get_plant_info' or similar). "
+    "If query_inventory returns 'No matching inventory found', try web_search "
+    "before giving up. Never write a function call out as plain text -- always "
+    "use the proper tool-calling mechanism, never describe one in prose (e.g. never say "
+    "'Using X, I found...') -- either you actually invoked the tool via the real "
+    "function-calling mechanism and got a real result, or you say you don't know. "
+    "Any specific plant location, quantity, or fact you state MUST have come from an "
+    "actual tool result present earlier in this conversation -- never state such a fact "
+    "from memory or assumption. "
+    "CRITICAL: once a tool returns a result, your final answer MUST directly state "
+    "the actual information found (the number, the definition, the fact) -- never "
+    "reply with only a vague acknowledgment like 'let me know if you need anything else' "
+    "without first stating what was actually found. "
+    "You have access to the earlier messages in this conversation -- use them for context "
+    "(e.g. if the user says 'what about bearings', check what plant was discussed earlier). "
+    "IMPORTANT for updates: this is a real, permanent change to the database, so only call "
+    "update_inventory after the user has explicitly confirmed (e.g. they said 'yes', 'do it', "
+    "'confirm', or similar) in response to you asking them to confirm the exact change. If they "
+    "ask to add/remove/change a quantity for the first time without having already confirmed, "
+    "first look up the current value with query_inventory, state the exact change you're about "
+    "to make (old value -> new value) and ask them to confirm before calling update_inventory. "
+    "NEVER reply with a mid-process filler phrase like 'let me check', 'let me look into that', "
+    "'let me search', or 'checking now' as your FINAL answer -- these are only acceptable as "
+    "internal reasoning before you actually call a tool, never as the message shown to the user. "
+    "Every final answer must contain the actual requested information (a number, a name, a fact, "
+    "or an explicit question asking for confirmation/clarification) -- not a promise to look something up."
 )
 
 
-# Signs the model leaked its internal tool-call syntax as plain text instead of
-# using the actual tool-calling mechanism (a known quirk of some Llama models on Groq)
-LEAKED_TOOLCALL_MARKERS = [
-    "<|python_tag|>", "python_tag", "query_inventory(", "web_search(", "update_inventory(", "get_plant_info(",
-    '"material":', '"plant":', '"new_quantity":', '"query":',  # raw JSON tool-args leaked as text
+FILLER_PHRASES = [
+    "let me check", "let me look", "let me search", "let me find",
+    "checking now", "i'll check", "i will check", "let me see",
 ]
-
-# Broader filler detection: catches "I will/I'll/let me/going to" + an action verb
-# (check/query/search/look/find), regardless of the exact phrasing used -- this covers
-# variants like "I will check", "let me query", "I'll search", "going to look up", etc.
-INTENT_WORDS = ["i will", "i'll", "let me", "i am going to", "i'm going to", "going to"]
-ACTION_WORDS = ["check", "query", "search", "look", "find", "verify", "confirm", "get the", "pull the", "fetch"]
 
 
 def _looks_like_filler(text: str) -> bool:
-    """Detect an unfinished 'I'll go look this up' reply, OR a leaked raw tool-call, instead of a real answer."""
+    """Detect an unfinished 'I'll go look this up' reply instead of an actual answer."""
     if not text:
         return True
     lowered = text.lower()
-    if any(marker.lower() in lowered for marker in LEAKED_TOOLCALL_MARKERS):
-        return True
-    if len(text) < 200:
-        has_intent = any(word in lowered for word in INTENT_WORDS)
-        has_action = any(word in lowered for word in ACTION_WORDS)
-        if has_intent and has_action:
-            return True
-    return False
+    return any(phrase in lowered for phrase in FILLER_PHRASES) and len(text) < 150
+
+
+def _serialize_assistant_message(response_message) -> dict:
+    """
+    Convert the Groq SDK's response message object into a plain dict containing
+    ONLY the fields that are valid in an outgoing request (role, content, tool_calls).
+
+    BUG THIS FIXES: the old code did `messages.append(response_message)`, appending the
+    raw pydantic object straight back into the message list. response_message.model_dump()
+    actually contains several response-only fields (`annotations`, `executed_tools`,
+    `function_call`, `reasoning`) that aren't part of a valid request message. When that
+    object got serialized into the *next* API call, Groq would sometimes reject it --
+    which the code misread as a `tool_use_failed` error and "fixed" by dropping tools
+    entirely and letting the model free-associate an answer. That's the root cause of the
+    hallucinated, fake tool-call narrations: the model was being asked to answer as if it
+    had tool access (because the system prompt still describes the tools) with no actual
+    tool attached, so it made something up that *looked* like a real tool result.
+    """
+    msg = {"role": "assistant", "content": response_message.content}
+    if response_message.tool_calls:
+        msg["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": tc.type,
+                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+            }
+            for tc in response_message.tool_calls
+        ]
+    return msg
 
 
 def run_chat(messages: list) -> str:
     """Core logic: runs the tool-calling loop given a full message list (with history), returns final answer text."""
-    max_rounds = 4  # one extra round of headroom for the filler-retry below
-    force_next_round = True  # always force a tool on round 0
+    max_rounds = 5  # one extra round of headroom for the filler-retry / tool-failure-retry below
     for round_num in range(max_rounds):
-        force_tool = force_next_round
-        force_next_round = False
+        force_tool = round_num == 0
         try:
             response = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -365,84 +335,62 @@ def run_chat(messages: list) -> str:
                 temperature=0,
             )
         except Exception as e:
-            if "tool_use_failed" in str(e):
-                # First, give it one more real attempt WITH tools (the failure may be transient)
-                try:
-                    retry_response = groq_client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
-                        messages=messages,
-                        tools=TOOLS,
-                        tool_choice="required",
-                        temperature=0,
-                    )
-                    retry_message = retry_response.choices[0].message
-                    if retry_message.tool_calls:
-                        # succeeded this time -- process it as a normal tool-calling round
-                        response_message = retry_message
-                        tool_calls = retry_message.tool_calls
-                        messages.append(response_message)
-                        for tool_call in tool_calls:
-                            fn_name = tool_call.function.name
-                            fn_args = json.loads(tool_call.function.arguments)
-                            fn = AVAILABLE_FUNCTIONS.get(fn_name)
-                            try:
-                                result = fn(**fn_args) if fn else "Unknown tool requested."
-                            except TypeError as te:
-                                result = f"Tool call had invalid arguments ({te}). Please try again."
-                            messages.append({
-                                "role": "tool", "tool_call_id": tool_call.id,
-                                "name": fn_name, "content": result,
-                            })
-                        continue  # go round the main loop again to get the final answer
-                except Exception:
-                    pass  # fall through to the no-tools fallback below
-
-                fallback = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=messages,
-                    temperature=0,
-                )
-                fallback_text = fallback.choices[0].message.content
-                if _looks_like_filler(fallback_text):
-                    return (
-                        "Sorry, I had trouble processing that request. Could you try rephrasing it "
-                        "(e.g. using the exact plant name) or asking again?"
-                    )
-                return fallback_text
+            err = str(e)
+            if "tool_use_failed" in err and round_num < max_rounds - 1:
+                # The model emitted a malformed tool call. Do NOT drop the tools and let it
+                # free-associate an answer -- that's what produced hallucinated "fake tool
+                # narrations" before. Instead, tell it plainly what happened and make it
+                # retry the tool call for real, with tools still attached.
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your last tool call attempt was malformed and was not executed. "
+                        "No information was retrieved. Do not answer from memory and do not "
+                        "describe a tool call in plain text -- call the tool again using the "
+                        "correct function-calling format."
+                    ),
+                })
+                continue
             raise HTTPException(status_code=500, detail=f"Groq API error: {e}")
 
         response_message = response.choices[0].message
         tool_calls = response_message.tool_calls
 
         if not tool_calls:
-            # Caught an unfinished "let me check" reply, or a leaked raw tool-call syntax,
-            # with rounds left -- force it to actually call a tool and finish the job.
-            if _looks_like_filler(response_message.content) and round_num < max_rounds - 1:
-                messages.append({"role": "user", "content": (
-                    "You did not actually provide an answer -- either you only said you would "
-                    "check, or you wrote out tool-call syntax as plain text instead of using the "
-                    "real tool-calling mechanism. Call the appropriate tool now, properly, and "
-                    "give the real answer."
-                )})
-                force_next_round = True  # make the retry round force a proper tool call too
-                continue
-            # Last chance and it's STILL broken -- never show raw/leaked syntax to the user.
-            if _looks_like_filler(response_message.content):
-                return (
-                    "Sorry, I had trouble processing that request. Could you try rephrasing it "
-                    "(e.g. using the exact plant name) or asking again?"
+            retry_reason = None
+            if force_tool:
+                # tool_choice was "required" this round, so a real tool call should have
+                # happened. Groq doesn't always enforce tool_choice="required" for this
+                # model -- the model can still just write plain text instead, sometimes
+                # narrating a completely invented tool name (e.g. "Using get_plant_info, I
+                # found...") with fabricated data. That text is NOT a real tool result and
+                # must never be trusted or returned as-is.
+                retry_reason = (
+                    "You did not actually call a tool, even though one was required for this "
+                    "turn, and no information was retrieved. Do not narrate a tool call in "
+                    "plain text and do not invent tool or function names -- the only tools "
+                    "that exist are query_inventory, web_search, and update_inventory. Call "
+                    "one of them for real now using the proper function-calling mechanism."
                 )
+            elif _looks_like_filler(response_message.content):
+                # Caught an unfinished "let me check" reply with rounds left -- force it to
+                # actually call a tool and finish the job instead of returning filler.
+                retry_reason = (
+                    "You did not actually provide an answer -- you only said you would check. "
+                    "Call the appropriate tool now and give the real answer."
+                )
+
+            if retry_reason and round_num < max_rounds - 1:
+                messages.append({"role": "user", "content": retry_reason})
+                continue
             return response_message.content
 
-        messages.append(response_message)
+        messages.append(_serialize_assistant_message(response_message))
         for tool_call in tool_calls:
             fn_name = tool_call.function.name
             fn_args = json.loads(tool_call.function.arguments)
             fn = AVAILABLE_FUNCTIONS.get(fn_name)
-            try:
-                result = fn(**fn_args) if fn else "Unknown tool requested."
-            except TypeError as e:
-                result = f"Tool call had invalid arguments ({e}). Please try again with correct parameters."
+            result = fn(**fn_args) if fn else "Unknown tool requested."
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
@@ -450,14 +398,11 @@ def run_chat(messages: list) -> str:
                 "content": result,
             })
 
-    final = groq_client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages)
-    final_text = final.choices[0].message.content
-    if _looks_like_filler(final_text):
-        return (
-            "Sorry, I had trouble processing that request. Could you try rephrasing it "
-            "(e.g. using the exact plant name) or asking again?"
-        )
-    return final_text
+    try:
+        final = groq_client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages)
+        return final.choices[0].message.content
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Groq API error: {e}")
 
 
 @app.get("/chat")
