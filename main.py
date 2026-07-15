@@ -274,7 +274,25 @@ def _looks_like_location_question(message: str) -> bool:
     return any(p in m for p in _LOCATION_PATTERNS)
 
 
-def _try_deterministic_location(message: str) -> Optional[str]:
+def _resolve_plant(message: str, history: Optional[list] = None) -> Optional[str]:
+    """
+    Find a known plant referenced by this message. If the message itself doesn't
+    name one (e.g. a follow-up like "where is it situated" or "what about that one"),
+    look backward through recent conversation turns for the last plant mentioned,
+    so pronouns resolve correctly instead of being searched/queried literally.
+    """
+    plant = _match_alias(message, PLANT_ALIASES)
+    if plant or not history:
+        return plant
+    for turn in reversed(history):
+        content = turn.get("content", "") if isinstance(turn, dict) else ""
+        p = _match_alias(content, PLANT_ALIASES)
+        if p:
+            return p
+    return None
+
+
+def _try_deterministic_location(message: str, history: Optional[list] = None) -> Optional[str]:
     """
     Location questions never touch the inventory DB (it has no location data) and
     never go through the LLM's tool-choice mechanism (which is what let the model
@@ -283,7 +301,7 @@ def _try_deterministic_location(message: str) -> Optional[str]:
     always explicitly labeled "[Web search result, not from the inventory database]"
     so there's no ambiguity about where the fact came from.
     """
-    plant = _match_alias(message, PLANT_ALIASES)
+    plant = _resolve_plant(message, history)
     query = f"{plant} location" if plant else message
     return web_search(query)
 
@@ -317,7 +335,7 @@ def _match_alias(text: str, alias_map: dict) -> Optional[str]:
     return best_name if best_score > 0.82 else None
 
 
-def _try_deterministic_lookup(message: str) -> Optional[str]:
+def _try_deterministic_lookup(message: str, history: Optional[list] = None) -> Optional[str]:
     """
     Attempt to answer directly from the database with zero LLM involvement.
     Returns a formatted answer if the message clearly matches a known plant
@@ -333,7 +351,7 @@ def _try_deterministic_lookup(message: str) -> Optional[str]:
         names = [r["plant"] for r in rows]
         return "The plants in the inventory system are:\n" + "\n".join(f"- {n}" for n in names)
 
-    plant = _match_alias(lower, PLANT_ALIASES)
+    plant = _resolve_plant(message, history)
     material = _match_alias(lower, MATERIAL_ALIASES)
 
     if not plant and not material:
@@ -651,10 +669,10 @@ def chat_with_memory(req: ChatRequest):
     # no LLM involved at all -- so the answer can never be hallucinated or mixed
     # up with the wrong tool/plant.
     if _looks_like_location_question(req.message):
-        return {"message": req.message, "answer": _try_deterministic_location(req.message)}
+        return {"message": req.message, "answer": _try_deterministic_location(req.message, req.history)}
 
     if not _looks_like_update(req.message) and not _looks_like_definition(req.message):
-        direct = _try_deterministic_lookup(req.message)
+        direct = _try_deterministic_lookup(req.message, req.history)
         if direct is not None:
             return {"message": req.message, "answer": direct}
 
