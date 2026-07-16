@@ -795,8 +795,8 @@ def _answer_read(message: str, history: Optional[list] = None) -> str:
 
 def _run_update(message: str, history: Optional[list] = None) -> str:
     """
-    Updates are the ONLY thing that still uses the LLM, because they need the
-    confirm-before-write conversation loop and the update_inventory tool.
+    Updates are the ONLY thing that still uses the tool-calling LLM loop, because
+    they need the confirm-before-write conversation flow and the update_inventory tool.
     """
     if not groq_client:
         raise HTTPException(status_code=500, detail="Groq API key not configured. Check your .env file.")
@@ -807,15 +807,191 @@ def _run_update(message: str, history: Optional[list] = None) -> str:
     return run_chat(messages)
 
 
+# ===========================================================================
+# PERMANENT ROUTING: LLM intent classifier (understands ANY phrasing)
+#
+# The old routing guessed intent from hardcoded keyword lists, so every new way
+# of phrasing a question ("enlist all the plants", "what is RTC solar project")
+# broke it and needed another keyword added. That never ends.
+#
+# Instead we now let the LLM do the ONE thing it's great at -- understanding what
+# the user wants, in any wording -- but ONLY to CLASSIFY and EXTRACT, never to
+# produce the answer. It returns strict JSON: an intent plus the canonical plant/
+# material names. Our code then executes deterministically and pulls every actual
+# fact from the database or web search. The model never states an inventory number
+# or a location itself, so it cannot hallucinate data -- it only decides routing.
+#
+# If the classifier is unavailable or returns junk, we fall back to the old
+# keyword router (_fallback_route), so the bot degrades gracefully, never crashes.
+# ===========================================================================
+
+_VALID_PLANTS = list(PLANT_ALIASES.keys())
+_VALID_MATERIALS = list(MATERIAL_ALIASES.keys())
+_VALID_INTENTS = {
+    "greeting", "list_plants", "location",
+    "inventory_lookup", "update", "general_question",
+}
+
+_CLASSIFIER_SYSTEM = (
+    "You are an intent classifier for a renewable-energy plant inventory assistant. "
+    "Read the user's latest message (using the earlier conversation for context) and "
+    "output ONLY a single JSON object -- no prose, no markdown, no code fences.\n\n"
+    "The JSON must have exactly these keys: intent, plant, material, new_quantity.\n\n"
+    "intent must be exactly one of:\n"
+    "- \"greeting\": greetings, thanks, small talk, or asking what the bot can do.\n"
+    "- \"list_plants\": the user wants the list of ALL plant names.\n"
+    "- \"location\": the user asks WHERE a plant is located.\n"
+    "- \"inventory_lookup\": the user asks about stock / quantity / which materials a "
+    "plant holds, or how many of a material exist.\n"
+    "- \"update\": the user wants to change/set/add/remove a stored quantity, OR is "
+    "confirming a pending change (e.g. \"yes\", \"confirm\", \"go ahead\").\n"
+    "- \"general_question\": a general, definitional, or knowledge question that is NOT "
+    "about our specific stored stock (e.g. \"what is SCADA\", \"what is an RTC solar project\", "
+    "\"why are gearboxes used\").\n\n"
+    "plant: the single best match from this EXACT list, copied verbatim, or null:\n"
+    f"{_VALID_PLANTS}\n\n"
+    "material: the single best match from this EXACT list, copied verbatim, or null:\n"
+    f"{_VALID_MATERIALS}\n\n"
+    "new_quantity: an integer for an update (the final absolute amount), else null.\n\n"
+    "Rules:\n"
+    "- plant and material MUST be copied verbatim from the lists above, or be null. Map "
+    "nicknames and typos to the correct entry (e.g. \"ron\" -> \"Ron Wind Farm\", "
+    "\"nizambad\" -> \"Nizamabad Solar Farm\", \"gearboxes\" -> \"Gearbox (multi-stage planetary)\").\n"
+    "- If the user says \"it\", \"that plant\", or similar, resolve which plant from the "
+    "earlier conversation.\n"
+    "- A question that merely mentions a material type in a definitional way "
+    "(\"what is a generator\") is general_question, NOT inventory_lookup.\n"
+    "- Output JSON only."
+)
+
+
+def classify_intent(message: str, history: Optional[list] = None) -> Optional[dict]:
+    """
+    Ask the LLM to classify the message into a structured intent. Returns a dict
+    {intent, plant, material, new_quantity} on success, or None to signal that the
+    caller should fall back to the keyword router.
+    """
+    if not groq_client:
+        return None
+    msgs = [{"role": "system", "content": _CLASSIFIER_SYSTEM}]
+    if history:
+        msgs.extend(history[-6:])  # a little context for pronouns / follow-ups
+    msgs.append({"role": "user", "content": message})
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=msgs,
+            temperature=0,
+            response_format={"type": "json_object"},  # force valid JSON
+        )
+        data = json.loads(resp.choices[0].message.content)
+    except Exception:
+        return None  # any failure -> fall back to keyword routing
+
+    intent = data.get("intent")
+    if intent not in _VALID_INTENTS:
+        return None
+
+    plant = data.get("plant")
+    if plant not in _VALID_PLANTS:
+        plant = None
+    material = data.get("material")
+    if material not in _VALID_MATERIALS:
+        material = None
+    nq = data.get("new_quantity")
+    if not isinstance(nq, int):
+        nq = None
+    return {"intent": intent, "plant": plant, "material": material, "new_quantity": nq}
+
+
+def _all_plant_names_reply() -> str:
+    conn = get_connection()
+    rows = conn.execute("SELECT DISTINCT plant FROM inventory ORDER BY plant").fetchall()
+    conn.close()
+    return "The plants in the inventory system are:\n" + "\n".join(f"- {r['plant']}" for r in rows)
+
+
+def _location_reply(plant: Optional[str]) -> str:
+    if plant is None:
+        return (
+            "I'm not sure which plant you mean. Could you tell me the plant name? "
+            "For example: 'Where is Ron Wind Farm located?'"
+        )
+    location = PLANT_LOCATIONS.get(plant)
+    if location:
+        return f"{plant} is located in {location}. (from the inventory system's plant records)"
+    return (
+        f"I don't have a recorded location for {plant} in the inventory system yet. "
+        f"You can add it to the plant records so I can answer this next time."
+    )
+
+
+def _dispatch(data: dict, message: str, history: Optional[list] = None) -> str:
+    """
+    Execute the classified intent deterministically. Every fact comes from the
+    database or web search -- the classifier only chose the route and the names.
+    """
+    intent = data["intent"]
+    plant = data["plant"]
+    material = data["material"]
+
+    if intent == "greeting":
+        return _GREETING_REPLY
+
+    if intent == "list_plants":
+        return _all_plant_names_reply()
+
+    if intent == "location":
+        return _location_reply(plant or _resolve_plant(message, history))
+
+    if intent == "general_question":
+        return web_search(message)
+
+    if intent == "update":
+        return _run_update(message, history)
+
+    # inventory_lookup
+    if not plant and not material:
+        return (
+            "There are records for 13 plants and their materials. Which plant or material "
+            "would you like? For example: \"inventory at Ron Wind Farm\" or \"how many generators\"."
+        )
+    result = query_inventory(plant=plant or "", material=material or "")
+    if result == "No matching inventory found.":
+        return (
+            "I couldn't find any matching inventory for that. Could you name the plant "
+            "or material more specifically?"
+        )
+    return result
+
+
+def _fallback_route(message: str, history: Optional[list] = None) -> str:
+    """
+    Keyword-based router, used only when the LLM classifier is unavailable or
+    returns something invalid. This is the previous behavior, kept as a safety net.
+    """
+    if _looks_like_greeting(message):
+        return _GREETING_REPLY
+    if _looks_like_location_question(message):
+        return _try_deterministic_location(message, history)
+    if _looks_like_update(message):
+        return _run_update(message, history)
+    return _answer_read(message, history)
+
+
+def _handle(message: str, history: Optional[list] = None) -> str:
+    """Single entry point: classify with the LLM, dispatch; fall back to keywords."""
+    data = classify_intent(message, history)
+    if data is None:
+        return _fallback_route(message, history)
+    return _dispatch(data, message, history)
+
+
 @app.get("/chat")
 def chat(message: str):
     """Simple version, no memory -- kept for backward-compatible testing via /docs."""
-    if _looks_like_greeting(message):
-        return {"message": message, "answer": _GREETING_REPLY}
-    if _looks_like_location_question(message):
-        return {"message": message, "answer": _try_deterministic_location(message)}
     try:
-        answer = _run_update(message) if _looks_like_update(message) else _answer_read(message)
+        answer = _handle(message)
     except HTTPException:
         raise
     except Exception as e:
@@ -836,19 +1012,12 @@ def chat_with_memory(req: ChatRequest):
     Memory-aware version: pass prior conversation turns in `history` so the bot
     can reference earlier questions (e.g. "what about bearings" after asking about a plant).
 
-    Routing (all deterministic; the LLM is only reached for updates):
-      greeting -> canned reply | location -> plant records | update -> LLM write loop
-      | everything else -> _answer_read (database or web search, never a forced dump)
+    Routing is now handled by the LLM intent classifier (classify_intent), which
+    understands any phrasing, with the old keyword router kept as an automatic
+    fallback. Every actual fact still comes from the database or web search.
     """
-    if _looks_like_greeting(req.message):
-        return {"message": req.message, "answer": _GREETING_REPLY}
-    if _looks_like_location_question(req.message):
-        return {"message": req.message, "answer": _try_deterministic_location(req.message, req.history)}
     try:
-        if _looks_like_update(req.message):
-            answer = _run_update(req.message, req.history)
-        else:
-            answer = _answer_read(req.message, req.history)
+        answer = _handle(req.message, req.history)
     except HTTPException:
         raise
     except Exception as e:
