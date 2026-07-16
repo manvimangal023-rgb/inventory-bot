@@ -221,6 +221,39 @@ PLANT_ALIASES = {
     "Jaisalmer Solar Project (Rajasthan)": ["jaisalmer solar project", "jaisalmer"],
 }
 
+# ---------------------------------------------------------------------------
+# Plant locations, kept right here in code (no database change needed).
+#
+# WHY THIS EXISTS: location questions used to be routed to a live web search,
+# because the inventory table stores no location. But searching a plant *name*
+# on the open web is unreliable -- "Ron Wind Farm" matched a fictional wind farm
+# from a video game, and the bot returned that. Since we have a fixed list of 13
+# real plants, their locations are fixed facts we can just store once, right here,
+# and answer instantly and correctly from our own system -- never the web.
+#
+# ⚠️ VERIFY THESE BEFORE YOUR DEMO. The values below are best-effort based on the
+# plant names; several are inferred and may be wrong (especially Ron, Limbwas, and
+# Code Phase). Replace any that are inaccurate with the real site/state from your
+# own ReNew Power records. Editing is easy -- just change the text on the right.
+# Any plant left out of this dict will make the bot honestly say it has no
+# recorded location for that plant, rather than guessing.
+# ---------------------------------------------------------------------------
+PLANT_LOCATIONS = {
+    "Ron Wind Farm": "Gadag district, Karnataka, India",            # ⚠️ verify
+    "Limbwas-I Wind Park": "Ratlam district, Madhya Pradesh, India",    # ⚠️ verify
+    "Limbwas-III Wind Park": "Ratlam district, Madhya Pradesh, India",  # ⚠️ verify
+    "Code Phase Wind Park": "Madhya Pradesh, India",                # ⚠️ verify
+    "Jasdan Wind Site": "Jasdan, Rajkot district, Gujarat, India",  # ⚠️ verify
+    "Karnataka RTC Wind Project": "Karnataka, India",
+    "Nizamabad Solar Farm": "Nizamabad district, Telangana, India",
+    "Madhya Pradesh Solar Project": "Madhya Pradesh, India",
+    "Rajasthan RTC Solar Project": "Rajasthan, India",
+    "Karnataka RTC Solar Project": "Karnataka, India",
+    "ReNew Peak Power Project - Wind (Andhra Pradesh)": "Andhra Pradesh, India",
+    "ReNew Peak Power Project - Solar (Andhra Pradesh)": "Andhra Pradesh, India",
+    "Jaisalmer Solar Project (Rajasthan)": "Jaisalmer district, Rajasthan, India",
+}
+
 # Casual/synonym ways people refer to each material. Order matters -- more
 # specific aliases are listed first so e.g. "yaw bearing" beats a generic "bearing".
 MATERIAL_ALIASES = {
@@ -249,11 +282,11 @@ _DEFINITION_PATTERNS = (
     "explain what", "what's the definition",
 )
 
-# Location questions get their own category: the DB has no location data at all,
-# so these should ALWAYS go to a real web search, clearly labeled as such --
-# never answered from the inventory table (which would be a wrong non-answer)
-# and never left to the LLM to decide whether/how to call a tool (which is what
-# produced the fabricated "Alberta, Canada" answer in the first place).
+# Location questions get their own category. The inventory TABLE has no location
+# column, but PLANT_LOCATIONS above holds the real location of each of our 13
+# plants -- so these are answered from our own records, in plain Python, with NO
+# LLM and NO web search. That's what stops a plant name from being searched on the
+# open web and matching something unrelated (the GTA "wind farm" incident).
 _LOCATION_PATTERNS = ("where is", "where's", "located", "location of")
 
 # Write/confirmation language should always go through the LLM's confirm-before-write
@@ -261,6 +294,33 @@ _LOCATION_PATTERNS = ("where is", "where's", "located", "location of")
 _UPDATE_PATTERNS = (
     "update", "set the", "set ", "change the", "increase", "decrease",
     "confirm", "yes, do it", "add ", "remove ",
+)
+
+# Greetings / small talk. These used to break the bot: a message like "hello"
+# names no plant, material, or location, so it fell through to the LLM path --
+# where tool_choice="required" FORCED the model to call a tool anyway, so it just
+# grabbed a plant's inventory and dumped it (that's why "hello" returned Ron Wind
+# Farm's full stock list). We now catch these first and reply conversationally,
+# touching no tool and no database at all.
+_GREETING_WORDS = {
+    "hi", "hii", "hiii", "hello", "helloo", "hellow", "hey", "heyy", "heya",
+    "yo", "hola", "sup", "howdy", "greetings", "morning", "afternoon",
+    "evening", "namaste", "thanks", "thank", "thankyou", "thanku", "thx", "ty",
+    "cheers", "ok", "okay", "cool", "nice", "great", "bye", "goodbye",
+}
+_GREETING_PHRASES = (
+    "how are you", "what can you do", "what do you do", "who are you",
+    "what are you", "can you help", "need help", "how do you work",
+    "what is this", "help me", "what can i ask",
+)
+
+_GREETING_REPLY = (
+    "Hello! I'm the inventory assistant for our renewable energy plants. I can help you with:\n"
+    "- Stock levels — e.g. \"How many turbines are at Ron Wind Farm?\"\n"
+    "- Plant locations — e.g. \"Where is Nizamabad Solar Farm located?\"\n"
+    "- Updating quantities — e.g. \"Set the generators at Jasdan Wind Site to 25\"\n"
+    "- General questions — e.g. \"What is SCADA?\"\n"
+    "What would you like to know?"
 )
 
 
@@ -272,6 +332,34 @@ def _looks_like_definition(message: str) -> bool:
 def _looks_like_location_question(message: str) -> bool:
     m = message.lower()
     return any(p in m for p in _LOCATION_PATTERNS)
+
+
+def _looks_like_greeting(message: str) -> bool:
+    """
+    True for greetings / small talk ("hello", "i said hello", "hey there",
+    "thanks", "how are you", "what can you do") -- but ONLY when the message
+    doesn't actually reference a known plant or material. That guard means a real
+    question like "hey, how many turbines at Ron?" is NOT treated as a greeting
+    (it names a plant and a material), so it still gets a proper data answer.
+    """
+    m = message.lower().strip()
+    for ch in ".,!?'\"-":
+        m = m.replace(ch, " ")
+    tokens = [t for t in m.split() if t]
+    if not tokens:
+        return False
+
+    # If the message clearly names a plant or material, it's a real query, not chit-chat.
+    if _match_alias(message, PLANT_ALIASES) or _match_alias(message, MATERIAL_ALIASES):
+        return False
+
+    joined = " ".join(tokens)
+    if any(p in joined for p in _GREETING_PHRASES):
+        return True
+    # A short message dominated by greeting words (e.g. "hello", "i said hello", "hey there").
+    if len(tokens) <= 6 and any(t in _GREETING_WORDS for t in tokens):
+        return True
+    return False
 
 
 def _resolve_plant(message: str, history: Optional[list] = None) -> Optional[str]:
@@ -292,18 +380,30 @@ def _resolve_plant(message: str, history: Optional[list] = None) -> Optional[str
     return None
 
 
-def _try_deterministic_location(message: str, history: Optional[list] = None) -> Optional[str]:
+def _try_deterministic_location(message: str, history: Optional[list] = None) -> str:
     """
-    Location questions never touch the inventory DB (it has no location data) and
-    never go through the LLM's tool-choice mechanism (which is what let the model
-    invent a fake tool and a fake Canadian location earlier in this conversation).
-    Instead, call the real web_search function directly ourselves. The result is
-    always explicitly labeled "[Web search result, not from the inventory database]"
-    so there's no ambiguity about where the fact came from.
+    Answer a location question from our own PLANT_LOCATIONS records -- never from
+    the inventory table (it has no location) and never from a live web search
+    (which matched a plant name to an unrelated video-game location before).
+
+    - If we can tell which plant is meant and we have its location -> state it.
+    - If we know the plant but haven't recorded its location -> say so honestly.
+    - If we can't tell which plant is meant -> ask which plant, rather than
+      guessing or searching the web.
     """
     plant = _resolve_plant(message, history)
-    query = f"{plant} location" if plant else message
-    return web_search(query)
+    if plant is None:
+        return (
+            "I'm not sure which plant you mean. Could you tell me the plant name? "
+            "For example: 'Where is Ron Wind Farm located?'"
+        )
+    location = PLANT_LOCATIONS.get(plant)
+    if location:
+        return f"{plant} is located in {location}. (from the inventory system's plant records)"
+    return (
+        f"I don't have a recorded location for {plant} in the inventory system yet. "
+        f"You can add it to the plant records so I can answer this next time."
+    )
 
 
 def _looks_like_update(message: str) -> bool:
@@ -311,6 +411,31 @@ def _looks_like_update(message: str) -> bool:
     if m in ("yes", "confirm", "do it", "yes do it", "yep", "go ahead"):
         return True
     return any(p in m for p in _UPDATE_PATTERNS)
+
+
+def _is_list_plants_request(message: str) -> bool:
+    """
+    True when the user wants the full list of plant NAMES (e.g. "list all plants",
+    "enlist all the plants", "what plants do you have", "show me every plant").
+
+    The old code matched only a handful of exact phrases, so "enlist all the plants"
+    slipped through -- it fell to the forced-tool LLM path, which just dumped one
+    plant's inventory instead. This checks the intent generally: the word "plant"
+    plus any listing cue, as long as the message doesn't name a SPECIFIC plant
+    (in which case it's a question about that one plant, not a list-them-all).
+    """
+    m = message.lower()
+    if "plant" not in m:
+        return False
+    if _match_alias(message, PLANT_ALIASES):  # names a specific plant -> not a list-all
+        return False
+    cues = (
+        "list", "enlist", "enumerate", "all plant", "all the plant",
+        "which plant", "what plant", "name the plant", "name all",
+        "plant names", "every plant", "show", "display", "how many plant",
+        "the plants", "give me the plant", "tell me the plant",
+    )
+    return any(c in m for c in cues)
 
 
 def _match_alias(text: str, alias_map: dict) -> Optional[str]:
@@ -344,7 +469,7 @@ def _try_deterministic_lookup(message: str, history: Optional[list] = None) -> O
     """
     lower = message.lower()
 
-    if any(p in lower for p in ("list all plants", "which plants", "what plants", "name all the plants", "all plant names")):
+    if _is_list_plants_request(message):
         conn = get_connection()
         rows = conn.execute("SELECT DISTINCT plant FROM inventory ORDER BY plant").fetchall()
         conn.close()
@@ -626,6 +751,9 @@ def run_chat(messages: list) -> str:
 @app.get("/chat")
 def chat(message: str):
     """Simple version, no memory -- kept for backward-compatible testing via /docs."""
+    if _looks_like_greeting(message):
+        return {"message": message, "answer": _GREETING_REPLY}
+
     if _looks_like_location_question(message):
         return {"message": message, "answer": _try_deterministic_location(message)}
 
@@ -668,6 +796,9 @@ def chat_with_memory(req: ChatRequest):
     # isn't an update or a definition question, answer straight from the DB with
     # no LLM involved at all -- so the answer can never be hallucinated or mixed
     # up with the wrong tool/plant.
+    if _looks_like_greeting(req.message):
+        return {"message": req.message, "answer": _GREETING_REPLY}
+
     if _looks_like_location_question(req.message):
         return {"message": req.message, "answer": _try_deterministic_location(req.message, req.history)}
 
