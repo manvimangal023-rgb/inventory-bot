@@ -329,6 +329,25 @@ def _looks_like_definition(message: str) -> bool:
     return any(p in m for p in _DEFINITION_PATTERNS)
 
 
+# Broader "general knowledge / definition" phrasing. A message like "what is RTC
+# solar project" or "why is SCADA useful" is a question about a CONCEPT, not a
+# request for stock levels -- so when it doesn't name a specific plant, it should
+# be answered by web search, never by dumping inventory. This is the check that
+# lets the bot finally tell "what IS X" apart from "how many X do we have".
+_GENERAL_QUESTION_PATTERNS = (
+    "what is", "what are", "what's", "whats", "what're", "what does",
+    "what do you mean", "who is", "who are", "who's", "explain",
+    "tell me about", "why is", "why are", "why does", "why do",
+    "how does", "how do ", "how is", "difference between",
+    "define", "definition of", "meaning of",
+)
+
+
+def _looks_like_general_question(message: str) -> bool:
+    m = message.lower()
+    return any(p in m for p in _GENERAL_QUESTION_PATTERNS)
+
+
 def _looks_like_location_question(message: str) -> bool:
     m = message.lower()
     return any(p in m for p in _LOCATION_PATTERNS)
@@ -748,35 +767,60 @@ def run_chat(messages: list) -> str:
         raise HTTPException(status_code=500, detail=f"Groq API error: {e}")
 
 
+def _answer_read(message: str, history: Optional[list] = None) -> str:
+    """
+    Router for READ questions (no database writes). This is the fix for the whole
+    class of "it dumped a random plant's inventory" bugs: reads NEVER go through the
+    LLM's forced tool-choice anymore, so the model can't be pushed into calling
+    query_inventory for a message that wasn't actually about inventory.
+
+    Order:
+      1. A general/knowledge question ("what is RTC solar project", "why is SCADA
+         useful") that does NOT name a specific plant -> web search.
+      2. A concrete inventory question (names a plant and/or material, or asks to
+         list all plants) -> answer straight from the database.
+      3. Anything left over -> web search (clearly labeled), rather than inventing
+         an inventory answer.
+    """
+    plant_ref = _resolve_plant(message, history)
+    if _looks_like_general_question(message) and not plant_ref:
+        return web_search(message)
+
+    direct = _try_deterministic_lookup(message, history)
+    if direct is not None:
+        return direct
+
+    return web_search(message)
+
+
+def _run_update(message: str, history: Optional[list] = None) -> str:
+    """
+    Updates are the ONLY thing that still uses the LLM, because they need the
+    confirm-before-write conversation loop and the update_inventory tool.
+    """
+    if not groq_client:
+        raise HTTPException(status_code=500, detail="Groq API key not configured. Check your .env file.")
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": message})
+    return run_chat(messages)
+
+
 @app.get("/chat")
 def chat(message: str):
     """Simple version, no memory -- kept for backward-compatible testing via /docs."""
     if _looks_like_greeting(message):
         return {"message": message, "answer": _GREETING_REPLY}
-
     if _looks_like_location_question(message):
         return {"message": message, "answer": _try_deterministic_location(message)}
-
-    if not _looks_like_update(message) and not _looks_like_definition(message):
-        direct = _try_deterministic_lookup(message)
-        if direct is not None:
-            return {"message": message, "answer": direct}
-
-    if not groq_client:
-        raise HTTPException(status_code=500, detail="Groq API key not configured. Check your .env file.")
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": message},
-    ]
     try:
-        answer = run_chat(messages)
+        answer = _run_update(message) if _looks_like_update(message) else _answer_read(message)
     except HTTPException:
         raise
     except Exception as e:
-        # Any unexpected crash here used to return a non-JSON 500 page, which the
-        # frontend can't parse -- it looked like "backend unreachable" even though
-        # the server was up. Always return real JSON so the frontend can show the
-        # actual error instead of a misleading network-failure message.
+        # Never let an unhandled exception produce a non-JSON response -- that's what
+        # made a real crash look like "backend unreachable" to the frontend.
         raise HTTPException(status_code=500, detail=f"Unexpected server error: {e}")
     return {"message": message, "answer": answer}
 
@@ -791,36 +835,23 @@ def chat_with_memory(req: ChatRequest):
     """
     Memory-aware version: pass prior conversation turns in `history` so the bot
     can reference earlier questions (e.g. "what about bearings" after asking about a plant).
+
+    Routing (all deterministic; the LLM is only reached for updates):
+      greeting -> canned reply | location -> plant records | update -> LLM write loop
+      | everything else -> _answer_read (database or web search, never a forced dump)
     """
-    # Deterministic path first: if this clearly names a known plant/material and
-    # isn't an update or a definition question, answer straight from the DB with
-    # no LLM involved at all -- so the answer can never be hallucinated or mixed
-    # up with the wrong tool/plant.
     if _looks_like_greeting(req.message):
         return {"message": req.message, "answer": _GREETING_REPLY}
-
     if _looks_like_location_question(req.message):
         return {"message": req.message, "answer": _try_deterministic_location(req.message, req.history)}
-
-    if not _looks_like_update(req.message) and not _looks_like_definition(req.message):
-        direct = _try_deterministic_lookup(req.message, req.history)
-        if direct is not None:
-            return {"message": req.message, "answer": direct}
-
-    if not groq_client:
-        raise HTTPException(status_code=500, detail="Groq API key not configured. Check your .env file.")
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(req.history)
-    messages.append({"role": "user", "content": req.message})
     try:
-        answer = run_chat(messages)
+        if _looks_like_update(req.message):
+            answer = _run_update(req.message, req.history)
+        else:
+            answer = _answer_read(req.message, req.history)
     except HTTPException:
         raise
     except Exception as e:
-        # Same reasoning as the /chat GET endpoint above: never let an unhandled
-        # exception produce a non-JSON response, since that's what made a real
-        # crash (e.g. the web_search argument-mismatch bug) look like "backend
-        # unreachable" to the frontend instead of a visible, debuggable error.
         raise HTTPException(status_code=500, detail=f"Unexpected server error: {e}")
     return {"message": req.message, "answer": answer}
 
